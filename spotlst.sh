@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 #
-set -- `getopt -u -a --longoptions 'mincpu: maxcpu: minmem: maxmem: maxprice: inst: intr: region:' "h" "$@"` || echo "help"
+set -- `getopt -u -a --longoptions 'mincpu: maxcpu: minmem: maxmem: maxprice: arch: inst: intr: region:' "h" "$@"` || echo "help"
 usage (){
  cat << EOF 1>&2
  Usage: $(basename $0) [-h usage]
@@ -13,6 +13,7 @@ usage (){
                        [--region <comma seperated AWS regions to use>]
                        [--intr <interruption rate - default 1>]
                        [--maxprice <maximum price for instance per hr>]
+                       [--arch <architecutre type arm,x86 - default x86>]
  Note:
       --intr <interruption rate> takes value from 0 to 4, 
              0 - <5% chane of being interrupted
@@ -64,6 +65,10 @@ while [ $# -gt 0  ]; do
       region=$2 
       shift 2
       ;;
+    --arch)
+      arch=$2
+      shift 2
+      ;;
     -*) 
       break
       ;;
@@ -82,9 +87,11 @@ trap cleanup EXIT
 
 [ -z ${intr} ] && intr=1
 
+[ -z ${arch} ] && arch='x86'
+
 if ! wget -q https://spot-bid-advisor.s3.amazonaws.com/spot-advisor-data.json;then echo "spot-advisor-data.json download failed" 1>&2;exit 1;fi
 
-
+export AWS_DEFAULT_REGION="us-east-1"
 inst_type_lst=$(cat spot-advisor-data.json |jq -r  --arg min_cpu ${mincpu} --arg max_cpu ${maxcpu} --arg min_mem ${minmem} --arg max_mem ${maxmem} '.["instance_types"]|keys[] as $k | (.[$k] | select((.cores >= ($min_cpu|tonumber)) and (.cores <= ($max_cpu|tonumber)) and select((.ram_gb >= ($min_mem|tonumber)) and (.ram_gb <= ($max_mem|tonumber))) ))|$k')
 
 [ -z ${inst} ] && inst=$(echo ${inst_type_lst}|sed 's/ /,/g')
@@ -98,7 +105,13 @@ inst_zone_lst=$(for inst in ${typ_lst[*]};do cat spot-advisor-data.json |jq -r  
 IFS=',' read -r -a zone_lst <<< $(echo ${region}|sed 's/ /,/g')
 
 inst_zone_match=false
-for i in ${inst_zone_lst}; do  zone=`echo ${i}|cut -d "," -f1`;  inst=`echo $i|cut -d "," -f2`; if echo ${zone_lst[*]}|grep -q ${zone} && echo ${typ_lst[*]}|grep -q ${inst};then inst_zone_match=true;fi;done
+for i in ${inst_zone_lst}; do
+        zone=`echo ${i}|cut -d "," -f1`;
+	inst=`echo $i|cut -d "," -f2`;
+	if echo ${zone_lst[*]}|grep -q ${zone} && echo ${typ_lst[*]}|grep -q ${inst};then
+		inst_zone_match=true;
+	fi;
+done
 
 if ! ${inst_zone_match};then
   echo "Spot instance type and zone combination not available" 1>&2
@@ -112,4 +125,16 @@ if [ -z ${maxprice} ];then
 fi
 
 echo "region,zone,instance_type,price,savings,iterrupt"
-for i in ${inst_zone_lst}; do  zone=`echo $i|cut -d "," -f1`;  inst=`echo ${i}|cut -d "," -f2`;intr=`echo $i|cut -d "," -f3`;pct=`echo $i|cut -d "," -f4`;if echo ${zone_lst[*]}|grep -q ${zone} && echo ${typ_lst[*]}|grep -q ${inst};then AWS_DEFAULT_REGION=${zone} aws ec2 describe-spot-price-history --start-time=$(date +%s) --product-descriptions="Linux/UNIX" --query 'SpotPriceHistory[*].{az:AvailabilityZone, price:SpotPrice}' --instance-types ${inst} 2> /dev/null |jq -r  --arg maxp ${maxprice} --arg inst ${inst} --arg zone ${zone} --arg intr ${intr} --arg pct ${pct}  'max_by(.price)|select(.price|tonumber < ($maxp|tonumber) )|"\($zone),\(.az),\($inst),\(.price),\($pct),\($intr)"';fi;done
+for i in ${inst_zone_lst}; do
+	zone=`echo $i|cut -d "," -f1`;
+	inst=`echo ${i}|cut -d "," -f2`;
+	intr=`echo $i|cut -d "," -f3`;
+	pct=`echo $i|cut -d "," -f4`;
+	if echo ${zone_lst[*]}|grep -q ${zone} && echo ${typ_lst[*]}|grep -q ${inst};then
+		if [  -z `aws ec2 describe-instance-types --instance-types ${inst}  --region ${zone}|jq -r --arg arc ${arch} '.["InstanceTypes"][0]["ProcessorInfo"]["SupportedArchitectures"][]| select(match($arc))'` ] ; then
+			continue
+		fi
+		instprice=`AWS_DEFAULT_REGION=us-east-1 aws pricing get-products --service-code AmazonEC2  --filters "Type=TERM_MATCH,Field=instanceType,Value=${inst}" "Type=TERM_MATCH,Field=regionCode,Value=${zone}" "Type=TERM_MATCH,Field=operatingSystem,Value=Linux" "Type=TERM_MATCH,Field=preInstalledSw,Value=NA" "Type=TERM_MATCH,Field=capacitystatus,Value=UnusedCapacityReservation"  "Type=TERM_MATCH,Field=tenancy,Value=Shared"|jq -rc '.PriceList[]' | jq -r '.terms.OnDemand[].priceDimensions[].pricePerUnit.USD'`
+		AWS_DEFAULT_REGION=${zone} aws ec2 describe-spot-price-history --start-time=$(date +%s) --product-descriptions="Linux/UNIX" --query 'SpotPriceHistory[*].{az:AvailabilityZone, price:SpotPrice}' --instance-types ${inst} 2> /dev/null |jq -r  --arg maxp ${maxprice} --arg instmax ${instprice}  --arg inst ${inst} --arg zone ${zone} --arg intr ${intr} --arg pct ${pct}  '.[]|select(.price|tonumber < ($instmax|tonumber)*((100-($pct|tonumber)+1))/100 )|select(.price|tonumber < ($maxp|tonumber))|"\($zone),\(.az),\($inst),\(.price),\($pct),\($intr)"';
+	fi;
+done
